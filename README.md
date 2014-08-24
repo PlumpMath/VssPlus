@@ -1,4 +1,4 @@
 VssPlus
 ======
 
-用SourceSafe.Interop API实现的简单VSS操作
+用SourceSafe.Interop API实现简单的VSS操作
