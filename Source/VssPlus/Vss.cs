@@ -20,6 +20,7 @@ namespace VssPlus
     using System;
     using System.Collections.Generic;
     using System.IO;
+    using System.Linq;
     using System.Threading.Tasks;
 
     using Microsoft.VisualStudio.SourceSafe.Interop;
@@ -29,7 +30,7 @@ namespace VssPlus
     #endregion
 
     /// <summary>Visual SourceSafe交互操作类</summary>
-    public class Vss
+    public class Vss : IDisposable
     {
         #region Constants
 
@@ -55,6 +56,11 @@ namespace VssPlus
         /// <summary>起始项目</summary>
         private string startPath = "$/";
 
+        /// <summary>项目列表的缓存</summary>
+        private HashSet<string> cacheItems = new HashSet<string>();
+
+        bool disposed = false;
+
         #endregion
 
         #region Constructors and Destructors
@@ -62,6 +68,13 @@ namespace VssPlus
         /// <summary>实例化VSS <see cref="Vss" /> 对象</summary>
         private Vss()
         {
+        }
+
+        ~Vss()
+        {
+            this.Dispose(false);
+
+            GC.SuppressFinalize(this);
         }
 
         #endregion
@@ -77,11 +90,70 @@ namespace VssPlus
         {
             var vss = new Vss();
             var result = vss.Init(config);
-            if (result)
+
+            return result ? vss : null;
+        }
+
+        /// <summary>
+        /// 列举服务器所有项目
+        /// </summary>
+        /// <param name="item">项目检索名</param>
+        /// <param name="config">选项</param>
+        /// <returns>是否成功</returns>
+        public bool Dir(string item, IReadOnlyDictionary<string, string> config)
+        {
+            try
             {
-                return vss;
+                if (item.StartsWith("$/"))
+                {
+                    // 是否递归子目录
+                    var isRecursive = false;
+
+                    if (config != null)
+                    {
+                        if (config.ContainsKey("Recursive"))
+                        {
+                            isRecursive = config["Recursive"].ConvertTo<bool>();
+                        }
+                    }
+
+                    // 递归获取项目全路径
+                    var root = this.database.VSSItem[item, false];
+                    this.Find(
+                        root,
+                        isRecursive,
+                        vssItem =>
+                            this.cacheItems.Add(vssItem.Spec));
+
+                    History.Factory.Push(string.Format("Success for get the item list: {0}", item));
+
+                    return true;
+                }
+                else
+                {
+                    History.Factory.Push(string.Format("[Error]Path is not correct : {0}", item));
+                    return false;
+                }
             }
-            return null;
+            catch (Exception)
+            {
+                History.Factory.Push(string.Format("[Error]Path is not correct : {0}", item));
+                return false;
+            }
+        }
+
+        /// <summary>
+        ///     异步列举服务器所有项目
+        /// </summary>
+        /// <param name="item">项目检索名</param>
+        /// <param name="config">选项</param>
+        /// <returns>是否成功</returns>
+        public Task<bool> DirAsync(string item, IReadOnlyDictionary<string, string> config)
+        {
+            return Task.Run(
+                () =>
+                this.Dir(item, config)
+                );
         }
 
         /// <summary>
@@ -90,7 +162,7 @@ namespace VssPlus
         /// <param name="item">项目检索名</param>
         /// <param name="config">选项和版本号</param>
         /// <returns>是否成功</returns>
-        public bool Get(string item, Dictionary<string, string> config)
+        public bool Get(string item, IReadOnlyDictionary<string, string> config)
         {
             string path;
 
@@ -101,9 +173,21 @@ namespace VssPlus
             }
             else
             {
-                // 递归获取项目全路径
-                var root = this.database.VSSItem[this.startPath, false];
-                path = this.Find(root, item);
+                var cache = this.cacheItems.FirstOrDefault(
+                    p =>
+                        p.EndsWith(item));
+                if (!cache.IsNullOrWhiteSpace())
+                {
+                    path = cache;
+                }
+                else
+                {
+                    History.Factory.Push(string.Format("The cache item is not found, continue to look for : {0}", item));
+
+                    // 递归获取项目全路径
+                    var root = this.database.VSSItem[this.startPath, false];
+                    path = this.GetPath(root, item);
+                }
             }
 
             if (!string.IsNullOrEmpty(path))
@@ -123,7 +207,7 @@ namespace VssPlus
         /// <param name="item">项目检索名</param>
         /// <param name="config">选项和版本号</param>
         /// <returns>是否成功</returns>
-        public Task<bool> GetAsync(string item, Dictionary<string, string> config)
+        public Task<bool> GetAsync(string item, IReadOnlyDictionary<string, string> config)
         {
             return Task.Run(
                 () =>
@@ -135,45 +219,34 @@ namespace VssPlus
 
         #region Methods
 
-        private void DeleteFiles(string path)
+        /// <summary>
+        ///     递归寻找项目列表
+        /// </summary>
+        /// <param name="root">根项目</param>
+        /// <param name="isRecursive">项目检索名</param>
+        /// <param name="action">x匹配项要执行的处理</param>
+        private void Find(IVSSItem root, bool isRecursive, Action<IVSSItem> action)
         {
-            var attr = File.GetAttributes(path);
-
-            if ((attr & FileAttributes.Directory) == FileAttributes.Directory)
+            if (root.Type == VSSItemType.VSSITEM_FILE.ConvertTo<int>())
             {
-                var paths = Directory.EnumerateFileSystemEntries(
-                    path,
-                    "*",
-                    SearchOption.TopDirectoryOnly);
-
-                foreach (var p in paths)
+                if (isRecursive)
                 {
-                    this.DeleteFiles(p);
-                }
-
-                if (Directory.Exists(path))
-                {
-                    if ((attr & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
-                    {
-                        File.SetAttributes(path, attr | FileAttributes.ReadOnly);
-                    }
-
-                    Directory.Delete(path);
+                    action(root);
                 }
             }
             else
             {
-                if (File.Exists(path))
-                {
-                    //attr = File.GetAttributes(path);
-                    if ((attr & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
-                    {
-                        File.SetAttributes(path, attr | FileAttributes.ReadOnly);
-                    }
+                action(root);
 
-                    File.Delete(path);
+                // 是目录时，继续向下递归寻找
+                var items = root.Items[false];
+                foreach (var vssItem in items.OfType<VSSItem>())
+                {
+                    this.Find(vssItem, isRecursive, action);
                 }
+
             }
+
         }
 
         /// <summary>
@@ -182,8 +255,11 @@ namespace VssPlus
         /// <param name="root">根项目</param>
         /// <param name="pattern">项目检索名</param>
         /// <returns>项目全路径</returns>
-        private string Find(IVSSItem root, string pattern)
+        private string GetPath(IVSSItem root, string pattern)
         {
+            // 推入缓存
+            this.cacheItems.Add(root.Spec);
+
             // 当前项目名，直接返回
             if (root.Name.EndsWith(pattern)
                 || root.Spec.EndsWith(pattern))
@@ -195,26 +271,25 @@ namespace VssPlus
             if (root.Type == VSSItemType.VSSITEM_PROJECT.ConvertTo<int>())
             {
                 var items = root.Items[false];
-                foreach (var o in items)
+                foreach (var vssItem in items.OfType<VSSItem>())
                 {
-                    var vssItem = o as VSSItem;
-                    if (vssItem != null)
+                    // 推入缓存
+                    this.cacheItems.Add(vssItem.Spec);
+
+                    // 当前项目名，直接返回
+                    if (vssItem.Name.EndsWith(pattern)
+                        || vssItem.Spec.EndsWith(pattern))
                     {
-                        // 当前项目名，直接返回
-                        if (vssItem.Name.EndsWith(pattern)
-                            || vssItem.Spec.EndsWith(pattern))
-                        {
-                            return vssItem.Spec;
-                        }
+                        return vssItem.Spec;
+                    }
 
-                        // 继续向下递归寻找
-                        var result = this.Find(vssItem, pattern);
+                    // 继续向下递归寻找
+                    var result = this.GetPath(vssItem, pattern);
 
-                        // 有匹配项返回，否则继续循环
-                        if (!string.IsNullOrEmpty(result))
-                        {
-                            return result;
-                        }
+                    // 有匹配项返回，否则继续循环
+                    if (!string.IsNullOrEmpty(result))
+                    {
+                        return result;
                     }
                 }
             }
@@ -282,7 +357,9 @@ namespace VssPlus
                     this.currentItem = this.currentItem.Version[version];
                 }
 
-                History.Factory.Push(string.Format("Getting : {0}", this.currentItem.Spec));
+                // 推入缓存
+                this.cacheItems.Add(this.currentItem.Spec);
+                History.Factory.Push(string.Format("Getting Item(Version:{0}) : {1}", version, this.currentItem.Spec));
 
                 // 设定本地下载路径
                 var relativePath = path.Replace("$", string.Empty).Replace('/', '\\');
@@ -302,7 +379,6 @@ namespace VssPlus
                 case (int)VSSItemType.VSSITEM_PROJECT:
                     if (isDelete && Directory.Exists(localPath))
                     {
-                        //DeleteFiles(localPath);
                     }
 
                     this.currentItem.Get(ref localPath, flags);
@@ -341,13 +417,25 @@ namespace VssPlus
                 this.startPath = config["StartPath"];
                 this.localDir = config["LocalPath"];
 
+                // 新建VSS库
                 this.database = new VSSDatabase();
-                this.database.Open(
-                    new FileInfo(databasePath).FullName,
-                    userName,
-                    password);
+                // 打开VSS库
+                this.database.Open(new FileInfo(databasePath).FullName, userName, password);
 
                 History.Factory.Push("Successfully connect VSS repository");
+
+                // 加载缓存项目列表
+                var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "CacheItems.json");
+                if (File.Exists(path))
+                {
+                    var cache = path.JsonDeserialize<HashSet<string>>();
+                    if (cache != null)
+                    {
+                        this.cacheItems = cache;
+                        History.Factory.Push("Successfully loaded item list");
+                    }
+                }
+
                 return true;
             }
             catch (Exception)
@@ -358,5 +446,37 @@ namespace VssPlus
         }
 
         #endregion
+
+        /// <summary>
+        /// 释放托管资源
+        /// </summary>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (this.disposed)
+                return;
+
+            if (disposing)
+            {
+                // 释放托管资源
+                var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "CacheItems.json");
+                this.cacheItems.JsonSerialize(path);
+            }
+
+            // 释放非托管资源
+            this.database.Close();
+            this.database = null;
+            this.currentItem = null;
+
+            this.disposed = true;
+        }
+
+        /// <summary>
+        /// 释放托管资源
+        /// </summary>
+        public void Dispose()
+        {
+            this.Dispose(true);
+            GC.SuppressFinalize(this);
+        }
     }
 }

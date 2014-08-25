@@ -31,6 +31,16 @@ namespace VssPlus.Extensions
     {
         #region Public Methods and Operators
 
+        public static bool IsNullOrEmpty(this string value)
+        {
+            return string.IsNullOrEmpty(value);
+        }
+
+        public static bool IsNullOrWhiteSpace(this string value)
+        {
+            return string.IsNullOrWhiteSpace(value);
+        }
+
         /// <summary>
         ///     对字符串执行不区分大小写的比较
         /// </summary>
